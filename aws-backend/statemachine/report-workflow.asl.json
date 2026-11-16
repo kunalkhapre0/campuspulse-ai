@@ -1,0 +1,80 @@
+{
+  "Comment": "CampusPulse AI automated report generation workflow",
+  "StartAt": "AggregateFeedback",
+  "States": {
+    "AggregateFeedback": {
+      "Type": "Task",
+      "Resource": "${ReportWorkerFunctionArn}",
+      "Parameters": {
+        "step": "AGGREGATE_FEEDBACK",
+        "reportId.$": "$.reportId",
+        "eventId.$": "$.eventId"
+      },
+      "ResultPath": "$.aggregated",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkReportFailed"
+        }
+      ],
+      "Next": "SynthesizeWithBedrock"
+    },
+    "SynthesizeWithBedrock": {
+      "Type": "Task",
+      "Resource": "${ReportWorkerFunctionArn}",
+      "Parameters": {
+        "step": "SYNTHESIZE_BEDROCK",
+        "reportId.$": "$.reportId",
+        "eventId.$": "$.eventId",
+        "aggregated.$": "$.aggregated"
+      },
+      "ResultPath": "$.synthesis",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkReportFailed"
+        }
+      ],
+      "Next": "PersistToPrivateS3"
+    },
+    "PersistToPrivateS3": {
+      "Type": "Task",
+      "Resource": "${ReportWorkerFunctionArn}",
+      "Parameters": {
+        "step": "WRITE_S3_AND_COMPLETE",
+        "reportId.$": "$.reportId",
+        "eventId.$": "$.eventId",
+        "aggregated.$": "$.aggregated",
+        "synthesis.$": "$.synthesis"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkReportFailed"
+        }
+      ],
+      "End": true
+    },
+    "MarkReportFailed": {
+      "Type": "Task",
+      "Resource": "${ReportWorkerFunctionArn}",
+      "Parameters": {
+        "step": "MARK_FAILED",
+        "reportId.$": "$.reportId",
+        "error.$": "$.error"
+      },
+      "End": true
+    }
+  }
+}

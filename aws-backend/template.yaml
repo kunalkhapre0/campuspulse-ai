@@ -1,0 +1,242 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: CampusPulse AI — Serverless Campus Event Intelligence Platform (API Gateway, Lambda, DynamoDB, S3, Step Functions, Bedrock)
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 20
+    MemorySize: 256
+    Environment:
+      Variables:
+        EVENTS_TABLE: !Ref EventsTable
+        REGISTRATIONS_TABLE: !Ref RegistrationsTable
+        FEEDBACK_TABLE: !Ref FeedbackTable
+        REPORTS_TABLE: !Ref ReportsTable
+        REPORTS_BUCKET: !Ref ReportsBucket
+        BEDROCK_MODEL_ID: anthropic.claude-3-5-sonnet-20240620-v1:0
+
+Parameters:
+  AllowedOrigin:
+    Type: String
+    Default: '*'
+    Description: CORS origin for the CampusPulse AI frontend
+
+Resources:
+  CampusPulseHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref AllowedOrigin
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  RegistrationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+
+  FeedbackTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+        - AttributeName: id
+          KeyType: RANGE
+
+  ReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  EventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers/events.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegistrationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FeedbackTable
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusPulseHttpApi
+            Path: /health
+            Method: GET
+        ListEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusPulseHttpApi
+            Path: /events
+            Method: GET
+        CreateEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusPulseHttpApi
+            Path: /events
+            Method: POST
+        RegisterEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusPulseHttpApi
+            Path: /events/{id}/register
+            Method: POST
+        SubmitFeedback:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusPulseHttpApi
+            Path: /events/{id}/feedback
+            Method: POST
+
+  AnalyticsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers/analytics.handler
+      Timeout: 29
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref FeedbackTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: '*'
+      Events:
+        GetAnalytics:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusPulseHttpApi
+            Path: /events/{id}/analytics
+            Method: GET
+
+  ReportWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers/reports.workerHandler
+      Timeout: 60
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref FeedbackTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ReportsTable
+        - S3WritePolicy:
+            BucketName: !Ref ReportsBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: '*'
+
+  ReportStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachine/report-workflow.asl.json
+      DefinitionSubstitutions:
+        ReportWorkerFunctionArn: !GetAtt ReportWorkerFunction.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ReportWorkerFunction
+
+  ReportsApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers/reports.apiHandler
+      Environment:
+        Variables:
+          REPORT_STATE_MACHINE_ARN: !Ref ReportStateMachine
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref FeedbackTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ReportsTable
+        - S3ReadPolicy:
+            BucketName: !Ref ReportsBucket
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt ReportStateMachine.Name
+      Events:
+        StartReport:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusPulseHttpApi
+            Path: /events/{id}/reports
+            Method: POST
+        GetReport:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusPulseHttpApi
+            Path: /reports/{id}
+            Method: GET
+
+Outputs:
+  ApiEndpoint:
+    Description: Invoke URL for CampusPulse AI HTTP API (set as VITE_API_BASE_URL)
+    Value: !Sub 'https://${CampusPulseHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  ReportsBucketName:
+    Description: Private S3 bucket storing automated event reports
+    Value: !Ref ReportsBucket
+  ReportStateMachineArn:
+    Description: AWS Step Functions ARN for automated report orchestration
+    Value: !Ref ReportStateMachine
